@@ -1,0 +1,98 @@
+name: ARC pinned observation profiler debug build
+on:
+  push:
+    branches: [build/arc-v1.13.0-observation-profiler]
+    paths: ['.github/workflows/pinned-arc-observation-profiler.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  profiler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: d4cba3b0c2ac84082471e8740430a13b4f6d7ddb
+      NDK_VERSION: '27.2.12479018'
+      SDK_PLATFORM: 'android-37.0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: d4cba3b0c2ac84082471e8740430a13b4f6d7ddb
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git submodule status --recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: vendor/cloudflared/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: 'false'
+      - name: Android SDK
+        run: |
+          set -euo pipefail
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$sdk" ]; then sdk="$(command -v sdkmanager)"; fi
+          "$sdk" --version
+          echo "Installed platforms and NDKs:"
+          ls -la "$ANDROID_HOME/platforms" "$ANDROID_HOME/ndk" || true
+          if [ ! -f "$ANDROID_HOME/platforms/$SDK_PLATFORM/android.jar" ]; then
+            "$sdk" --list --channel=0 > "$RUNNER_TEMP/sdk-packages.txt"
+            grep -E 'platforms;android-37|ndk;27\.2\.12479018' "$RUNNER_TEMP/sdk-packages.txt" || true
+            if ! grep -Eq '^[[:space:]]*platforms;android-37\.0[[:space:]]*\|' "$RUNNER_TEMP/sdk-packages.txt"; then
+              echo "::error::Required SDK platform android-37.0 is unavailable; refusing to substitute another API level."
+              exit 1
+            fi
+            "$sdk" --channel=0 "platforms;$SDK_PLATFORM"
+          fi
+          test -f "$ANDROID_HOME/platforms/$SDK_PLATFORM/android.jar"
+          cat "$ANDROID_HOME/platforms/$SDK_PLATFORM/source.properties"
+          if [ ! -f "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties" ]; then
+            "$sdk" "ndk;$NDK_VERSION"
+          fi
+          test -x "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+      - name: Native dependencies
+        run: |
+          make compile-cloudflared NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
+          make compile-ngrok-native NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
+      - name: Verify profiler unit tests and compile isolated debug APK
+        run: ./gradlew :app:testFossDebugUnitTest --tests '*ObservationTimingTest' -PVERSION_NAME=1.13.0
+      - name: Compile isolated debug APK
+        run: ./gradlew assembleFossDebug -PVERSION_NAME=1.13.0
+      - name: Verify and record artifact
+        run: |
+          mkdir -p profiler-artifacts
+          apk=$(find app/build/outputs/apk/foss/debug -name '*.apk' -type f -print -quit)
+          test -n "$apk"
+          cp "$apk" profiler-artifacts/
+          tools_dir=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$tools_dir/apksigner" verify --verbose --print-certs "$apk" > profiler-artifacts/signature.txt
+          "$tools_dir/aapt" dump badging "$apk" > profiler-artifacts/package.txt
+          git rev-parse HEAD > profiler-artifacts/source-sha.txt
+          git submodule status --recursive > profiler-artifacts/submodules.txt
+          cp "$ANDROID_HOME/platforms/$SDK_PLATFORM/source.properties" profiler-artifacts/sdk-platform.properties
+          cp "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties" profiler-artifacts/ndk.properties
+          sha256sum "$ANDROID_HOME/platforms/$SDK_PLATFORM/android.jar" > profiler-artifacts/sdk-platform.sha256
+          (cd profiler-artifacts && sha256sum ./*.apk > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arc-v1.13.0-foss-debug-observation-profiler
+          path: profiler-artifacts/
+          retention-days: 7
