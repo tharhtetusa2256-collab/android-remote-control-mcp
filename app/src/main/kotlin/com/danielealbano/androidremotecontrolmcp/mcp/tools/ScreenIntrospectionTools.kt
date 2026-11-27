@@ -112,33 +112,37 @@ class GetScreenStateHandler
             includeScreenshot: Boolean,
             annotate: Boolean,
             options: ScreenStateFormatOptions,
-        ): CallToolResult {
+        ): CallToolResult = profileObservation(ObservationKind.SCREEN) { timing ->
             // getFreshWindows clears the framework accessibility cache before reading (see there),
             // so this fresh capture — and the node cache it populates for element/action tools —
             // round-trips live even for stale-prone WebView content.
             // The node cache (used by element/action tools) is populated by getFreshWindows from the
             // original tree; the merge only collapses the tree shown to the LLM. Merged anchors keep
             // their original ids, so taps still resolve.
-            val rawResult =
-                webViewNodeMerger.merge(getFreshWindows(treeParser, accessibilityServiceProvider, nodeCache))
+            val fresh = getFreshWindows(treeParser, accessibilityServiceProvider, nodeCache, timing)
+            val rawResult = timing.stage(ObservationStage.WEBVIEW_MERGE) { webViewNodeMerger.merge(fresh) }
             // Redact the tree BEFORE anything downstream: the snapshot stores the REDACTED tree so paged
             // output and pseudonym mappings stay consistent. Fail-closed errors propagate as a tool error.
-            val processed = privacyToolGate.tree(rawResult)
+            val processed = timing.stage(ObservationStage.PRIVACY) { privacyToolGate.tree(rawResult) }
             val result = processed.result
-            val screenInfo = accessibilityServiceProvider.getScreenInfo()
-            val totalKept = compactTreeFormatter.countKeptNodes(result, options)
-            val totalPages = ceilDiv(totalKept, CompactTreeFormatter.PAGE_SIZE)
-            val compactOutput = buildFreshPageText(result, screenInfo, totalKept, totalPages, options)
+            val screenInfo = timing.stage(ObservationStage.SCREEN_INFO) { accessibilityServiceProvider.getScreenInfo() }
+            val (compactOutput, totalPages) = timing.stage(ObservationStage.FORMAT) {
+                val totalKept = compactTreeFormatter.countKeptNodes(result, options)
+                val pages = ceilDiv(totalKept, CompactTreeFormatter.PAGE_SIZE)
+                buildFreshPageText(result, screenInfo, totalKept, pages, options) to pages
+            }
             Log.d(
                 TAG,
                 "get_screen_state: includeScreenshot=$includeScreenshot annotate=$annotate " +
                     "includeOffscreen=${options.includeOffscreen} includeHierarchy=${options.includeHierarchy} " +
                     "pages=$totalPages",
             )
-            return if (includeScreenshot) {
-                buildScreenshotResult(result, screenInfo, compactOutput, processed.flaggedBounds, annotate)
+            if (includeScreenshot) {
+                timing.stage(ObservationStage.SCREENSHOT) {
+                    buildScreenshotResult(result, screenInfo, compactOutput, processed.flaggedBounds, annotate)
+                }
             } else {
-                McpToolUtils.untrustedTextResult(compactOutput)
+                timing.stage(ObservationStage.RESPONSE) { McpToolUtils.untrustedTextResult(compactOutput) }
             }
         }
 

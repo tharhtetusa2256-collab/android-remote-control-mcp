@@ -56,7 +56,7 @@ class FindNodesTool
         private val substitutor: PlaceholderSubstitutor,
     ) {
         @Suppress("ThrowsCount")
-        suspend fun execute(arguments: JsonObject?): CallToolResult {
+        suspend fun execute(arguments: JsonObject?): CallToolResult = profileObservation(ObservationKind.FIND) { timing ->
             // Validate parameters
             val byStr =
                 arguments?.get("by")?.jsonPrimitive?.contentOrNull
@@ -83,31 +83,36 @@ class FindNodesTool
                     )
 
             // Get fresh multi-window accessibility snapshot
-            val result = getFreshWindows(treeParser, accessibilityServiceProvider, nodeCache)
+            val result = getFreshWindows(treeParser, accessibilityServiceProvider, nodeCache, timing)
 
             // Search across all windows
             val elements =
-                elementFinder
-                    .findElements(result.windows, findBy, value, exactMatch)
-                    .filter { !visibleOnly || it.visible }
+                timing.stage(ObservationStage.MATCH) {
+                    elementFinder
+                        .findElements(result.windows, findBy, value, exactMatch)
+                        .filter { !visibleOnly || it.visible }
+                }
 
             Log.d(TAG, "find_nodes: by=$byStr, visibleOnly=$visibleOnly, found=${elements.size}")
 
-            val redactedElements = McpToolUtils.redactElements(privacyToolGate, result.windows, elements)
+            val redactedElements = timing.stage(ObservationStage.PRIVACY) {
+                McpToolUtils.redactElements(privacyToolGate, result.windows, elements)
+            }
 
-            val resultJson =
-                buildJsonObject {
-                    put(
-                        "nodes",
-                        buildJsonArray {
-                            redactedElements.forEach { element ->
-                                add(McpToolUtils.buildNodeJson(element))
-                            }
-                        },
-                    )
-                }
-
-            return McpToolUtils.untrustedTextResult(Json.encodeToString(resultJson))
+            timing.stage(ObservationStage.RESPONSE) {
+                val resultJson =
+                    buildJsonObject {
+                        put(
+                            "nodes",
+                            buildJsonArray {
+                                redactedElements.forEach { element ->
+                                    add(McpToolUtils.buildNodeJson(element))
+                                }
+                            },
+                        )
+                    }
+                McpToolUtils.untrustedTextResult(Json.encodeToString(resultJson))
+            }
         }
 
         fun register(
@@ -1064,7 +1069,8 @@ internal fun getFreshWindows(
     treeParser: AccessibilityTreeParser,
     accessibilityServiceProvider: AccessibilityServiceProvider,
     nodeCache: AccessibilityNodeCache,
-): MultiWindowResult = getFreshRead(treeParser, accessibilityServiceProvider, nodeCache).result
+    timing: ObservationTiming? = null,
+): MultiWindowResult = getFreshRead(treeParser, accessibilityServiceProvider, nodeCache, timing).result
 
 /** A fresh read: its [result] and the node references it put in the node cache, by node id. See [getFreshRead]. */
 internal data class FreshRead(
@@ -1085,19 +1091,24 @@ internal fun getFreshRead(
     treeParser: AccessibilityTreeParser,
     accessibilityServiceProvider: AccessibilityServiceProvider,
     nodeCache: AccessibilityNodeCache,
-): FreshRead =
+    timing: ObservationTiming? = null,
+): FreshRead {
     // Serialize the entire clear+read+populate critical section against concurrent MCP requests:
     // clearing the shared framework node cache mid-traversal of another request would yield a torn
     // tree and flaky node-id resolution. See AccessibilityTreeLock.
-    synchronized(AccessibilityTreeLock.monitor) {
-        getFreshReadLocked(treeParser, accessibilityServiceProvider, nodeCache)
+    val lockStarted = timing?.now()
+    return synchronized(AccessibilityTreeLock.monitor) {
+        timing?.recordSince(ObservationStage.LOCK_WAIT, lockStarted)
+        getFreshReadLocked(treeParser, accessibilityServiceProvider, nodeCache, timing)
     }
+}
 
 @Suppress("LongMethod", "NestedBlockDepth", "ThrowsCount")
 private fun getFreshReadLocked(
     treeParser: AccessibilityTreeParser,
     accessibilityServiceProvider: AccessibilityServiceProvider,
     nodeCache: AccessibilityNodeCache,
+    timing: ObservationTiming?,
 ): FreshRead {
     if (!accessibilityServiceProvider.isReady()) {
         throw McpToolException.PermissionDenied(
@@ -1114,7 +1125,7 @@ private fun getFreshReadLocked(
     // live and populate the node cache with live nodes. The lightweight wait_for_node/wait_for_idle
     // poll paths do not go through here and clear the cache themselves (see UtilityTools). See
     // AccessibilityServiceProvider.clearFrameworkNodeCache.
-    accessibilityServiceProvider.clearFrameworkNodeCache()
+    timing.stage(ObservationStage.CACHE_CLEAR) { accessibilityServiceProvider.clearFrameworkNodeCache() }
 
     // Accumulate real AccessibilityNodeInfo references from ALL windows for cache population.
     // This map is passed to each parseTree call and populated during tree traversal.
@@ -1122,7 +1133,9 @@ private fun getFreshReadLocked(
     // cache overwrite problem (Critical Finding 1).
     val accumulatedNodeMap = mutableMapOf<String, CachedNode>()
 
-    val accessibilityWindows = accessibilityServiceProvider.getAccessibilityWindows()
+    val accessibilityWindows = timing.stage(ObservationStage.WINDOW_COLLECTION) {
+        accessibilityServiceProvider.getAccessibilityWindows()
+    }
 
     if (accessibilityWindows.isNotEmpty()) {
         try {
@@ -1131,14 +1144,14 @@ private fun getFreshReadLocked(
             val windowDataList = mutableListOf<WindowData>()
 
             for (window in accessibilityWindows) {
-                val rootNode = window.root ?: continue
+                val rootNode = timing.stage(ObservationStage.WINDOW_COLLECTION) { window.root } ?: continue
 
                 // Force the accessibility framework to re-query the underlying
                 // AccessibilityNodeProvider (e.g., Compose's virtual node provider).
                 // Without this, window.root can return stale cached snapshots —
                 // particularly problematic for Jetpack Compose apps where
                 // TYPE_WINDOW_CONTENT_CHANGED events may be throttled or missed.
-                rootNode.refresh()
+                timing.stage(ObservationStage.ROOT_REFRESH) { rootNode.refresh() }
 
                 // Extract metadata BEFORE parsing
                 val wId = window.id
@@ -1151,7 +1164,9 @@ private fun getFreshReadLocked(
                 // Root nodes are NOT recycled — they are stored in accumulatedNodeMap
                 // and owned by the cache. On API 33+ recycle() is a no-op, but we
                 // avoid calling it on cached nodes for semantic clarity (Critical Finding 2).
-                val tree = treeParser.parseTree(rootNode, "root_w$wId", accumulatedNodeMap)
+                val tree = timing.stage(ObservationStage.TREE_TRAVERSAL) {
+                    treeParser.parseTree(rootNode, "root_w$wId", accumulatedNodeMap)
+                }
 
                 // Best-effort activity name: only for focused APPLICATION window matching tracked package
                 val activityName =
@@ -1185,7 +1200,7 @@ private fun getFreshReadLocked(
             }
 
             // Populate cache with ALL windows' nodes in a single atomic swap
-            nodeCache.populate(accumulatedNodeMap)
+            timing.stage(ObservationStage.NODE_CACHE) { nodeCache.populate(accumulatedNodeMap) }
 
             return FreshRead(MultiWindowResult(windows = windowDataList, degraded = false), accumulatedNodeMap)
         } finally {
@@ -1200,14 +1215,14 @@ private fun getFreshReadLocked(
 
     // Fallback to single-window mode
     val rootNode =
-        accessibilityServiceProvider.getRootNode()
+        timing.stage(ObservationStage.WINDOW_COLLECTION) { accessibilityServiceProvider.getRootNode() }
             ?: throw McpToolException.ActionFailed(
                 "No windows available and no active window root node. " +
                     "The screen may be transitioning.",
             )
 
     // Force fresh data from the accessibility framework (see multi-window path comment).
-    rootNode.refresh()
+    timing.stage(ObservationStage.ROOT_REFRESH) { rootNode.refresh() }
 
     // Extract metadata from the root node before recycling.
     // Use rootNode.window (available API 21+) to detect the actual window type
@@ -1225,10 +1240,12 @@ private fun getFreshReadLocked(
         }
 
     // Fallback path also accumulates into the same map and does NOT recycle root node
-    val tree = treeParser.parseTree(rootNode, "root_w$fallbackWindowId", accumulatedNodeMap)
+    val tree = timing.stage(ObservationStage.TREE_TRAVERSAL) {
+        treeParser.parseTree(rootNode, "root_w$fallbackWindowId", accumulatedNodeMap)
+    }
 
     // Populate cache with fallback window's nodes
-    nodeCache.populate(accumulatedNodeMap)
+    timing.stage(ObservationStage.NODE_CACHE) { nodeCache.populate(accumulatedNodeMap) }
 
     val currentPackageName = accessibilityServiceProvider.getCurrentPackageName()
     val currentActivityName = accessibilityServiceProvider.getCurrentActivityName()
