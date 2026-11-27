@@ -1,5 +1,6 @@
 package com.danielealbano.androidremotecontrolmcp.mcp.tools
 
+import com.danielealbano.androidremotecontrolmcp.BuildConfig
 import com.danielealbano.androidremotecontrolmcp.data.model.ServerLogEntry
 import com.danielealbano.androidremotecontrolmcp.data.repository.ServerLogRepository
 import com.danielealbano.androidremotecontrolmcp.mcp.InFlightToolCalls
@@ -20,6 +21,8 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 
 private const val NANOS_PER_MILLI = 1_000_000L
 private const val FAILED_MARKER = "failed"
@@ -173,7 +176,14 @@ class LoggedToolRegistrar internal constructor(
             val caller = inFlightToolCalls.callerOf(sessionId)
             // Logging outermost: withContext refuses to start in a cancelled request, which is still logged then
             loggedToolHandler(serverLog, toolName, toolCallIndicator) { call ->
-                if (caller == null) cancellable(call) else withContext(caller) { cancellable(call) }
+                val callerContext: CoroutineContext = caller ?: EmptyCoroutineContext
+                val context =
+                    if (BuildConfig.DEBUG && (toolName == "get_screen_state" || toolName == "find_nodes")) {
+                        callerContext + ObservationLogSink(serverLog)
+                    } else {
+                        callerContext
+                    }
+                if (context === EmptyCoroutineContext) cancellable(call) else withContext(context) { cancellable(call) }
             }(request)
         }
     }
