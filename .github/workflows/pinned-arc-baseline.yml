@@ -1,0 +1,65 @@
+name: ARC pinned baseline debug build
+on:
+  push:
+    branches: [build/arc-v1.13.0-baseline]
+    paths: ['.github/workflows/pinned-arc-baseline.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: ed77c267c76b54826b9a033301ac68f111ca079e
+      NDK_VERSION: '27.2.12479018'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ed77c267c76b54826b9a033301ac68f111ca079e
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git submodule status --recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Android SDK
+        run: sdkmanager "platforms;android-37" "ndk;$NDK_VERSION"
+      - name: Native dependencies
+        run: |
+          make compile-cloudflared NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
+          make compile-ngrok-native NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
+      - name: Compile isolated debug APK
+        run: ./gradlew assembleFossDebug -PVERSION_NAME=1.13.0
+      - name: Verify and record artifact
+        run: |
+          mkdir -p baseline-artifacts
+          apk=$(find app/build/outputs/apk/foss/debug -name '*.apk' -type f -print -quit)
+          test -n "$apk"
+          cp "$apk" baseline-artifacts/
+          tools_dir=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$tools_dir/apksigner" verify --verbose --print-certs "$apk" > baseline-artifacts/signature.txt
+          "$tools_dir/aapt" dump badging "$apk" > baseline-artifacts/package.txt
+          git rev-parse HEAD > baseline-artifacts/source-sha.txt
+          git submodule status --recursive > baseline-artifacts/submodules.txt
+          (cd baseline-artifacts && sha256sum ./*.apk > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arc-v1.13.0-foss-debug-baseline
+          path: baseline-artifacts/
+          retention-days: 7
