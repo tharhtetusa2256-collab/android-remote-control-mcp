@@ -13,6 +13,7 @@ jobs:
     env:
       SOURCE_SHA: ed77c267c76b54826b9a033301ac68f111ca079e
       NDK_VERSION: '27.2.12479018'
+      SDK_PLATFORM: 'android-37.0'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -52,16 +53,17 @@ jobs:
           "$sdk" --version
           echo "Installed platforms and NDKs:"
           ls -la "$ANDROID_HOME/platforms" "$ANDROID_HOME/ndk" || true
-          if [ ! -f "$ANDROID_HOME/platforms/android-37/android.jar" ]; then
-            "$sdk" --list --channel=3 > "$RUNNER_TEMP/sdk-packages.txt"
+          if [ ! -f "$ANDROID_HOME/platforms/$SDK_PLATFORM/android.jar" ]; then
+            "$sdk" --list --channel=0 > "$RUNNER_TEMP/sdk-packages.txt"
             grep -E 'platforms;android-37|ndk;27\.2\.12479018' "$RUNNER_TEMP/sdk-packages.txt" || true
-            if ! grep -Eq '^[[:space:]]*platforms;android-37[[:space:]]*\|' "$RUNNER_TEMP/sdk-packages.txt"; then
-              echo "::error::Exact compile SDK android-37 is unavailable; refusing to change source SDK."
+            if ! grep -Eq '^[[:space:]]*platforms;android-37\.0[[:space:]]*\|' "$RUNNER_TEMP/sdk-packages.txt"; then
+              echo "::error::Required SDK platform android-37.0 is unavailable; refusing to substitute another API level."
               exit 1
             fi
-            "$sdk" --channel=3 "platforms;android-37"
+            "$sdk" --channel=0 "platforms;$SDK_PLATFORM"
           fi
-          test -f "$ANDROID_HOME/platforms/android-37/android.jar"
+          test -f "$ANDROID_HOME/platforms/$SDK_PLATFORM/android.jar"
+          cat "$ANDROID_HOME/platforms/$SDK_PLATFORM/source.properties"
           if [ ! -f "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties" ]; then
             "$sdk" "ndk;$NDK_VERSION"
           fi
@@ -83,6 +85,9 @@ jobs:
           "$tools_dir/aapt" dump badging "$apk" > baseline-artifacts/package.txt
           git rev-parse HEAD > baseline-artifacts/source-sha.txt
           git submodule status --recursive > baseline-artifacts/submodules.txt
+          cp "$ANDROID_HOME/platforms/$SDK_PLATFORM/source.properties" baseline-artifacts/sdk-platform.properties
+          cp "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties" baseline-artifacts/ndk.properties
+          sha256sum "$ANDROID_HOME/platforms/$SDK_PLATFORM/android.jar" > baseline-artifacts/sdk-platform.sha256
           (cd baseline-artifacts && sha256sum ./*.apk > SHA256SUMS)
       - uses: actions/upload-artifact@v7
         with:
