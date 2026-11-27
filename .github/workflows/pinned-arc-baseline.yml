@@ -46,9 +46,26 @@ jobs:
           log-accepted-android-sdk-licenses: 'false'
       - name: Android SDK
         run: |
-          command -v sdkmanager
-          sdkmanager --version
-          sdkmanager "platforms;android-37" "ndk;$NDK_VERSION"
+          set -euo pipefail
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$sdk" ]; then sdk="$(command -v sdkmanager)"; fi
+          "$sdk" --version
+          echo "Installed platforms and NDKs:"
+          ls -la "$ANDROID_HOME/platforms" "$ANDROID_HOME/ndk" || true
+          if [ ! -f "$ANDROID_HOME/platforms/android-37/android.jar" ]; then
+            "$sdk" --list --channel=3 > "$RUNNER_TEMP/sdk-packages.txt"
+            grep -E 'platforms;android-37|ndk;27\.2\.12479018' "$RUNNER_TEMP/sdk-packages.txt" || true
+            if ! grep -Eq '^[[:space:]]*platforms;android-37[[:space:]]*\|' "$RUNNER_TEMP/sdk-packages.txt"; then
+              echo "::error::Exact compile SDK android-37 is unavailable; refusing to change source SDK."
+              exit 1
+            fi
+            "$sdk" --channel=3 "platforms;android-37"
+          fi
+          test -f "$ANDROID_HOME/platforms/android-37/android.jar"
+          if [ ! -f "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties" ]; then
+            "$sdk" "ndk;$NDK_VERSION"
+          fi
+          test -x "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
       - name: Native dependencies
         run: |
           make compile-cloudflared NDK_ROOT="$ANDROID_HOME/ndk/$NDK_VERSION"
