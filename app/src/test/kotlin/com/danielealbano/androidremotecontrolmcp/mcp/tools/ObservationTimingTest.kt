@@ -1,10 +1,16 @@
 package com.danielealbano.androidremotecontrolmcp.mcp.tools
 
+import com.danielealbano.androidremotecontrolmcp.BuildConfig
+import com.danielealbano.androidremotecontrolmcp.data.model.ServerLogEntry
+import com.danielealbano.androidremotecontrolmcp.testutil.RecordingServerLogRepository
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 
 class ObservationTimingTest {
@@ -62,4 +68,39 @@ class ObservationTimingTest {
             timing.summary(ObservationOutcome.CANCELLED),
         )
     }
+
+    @Test
+    fun `compact summary is below server log byte cap with all stages`() {
+        var now = 0L
+        val timing = ObservationTiming(ObservationKind.SCREEN) { now }
+        for (stage in ObservationStage.entries) {
+            timing.stage(stage) { now += 100_000_000_000_000_000L }
+        }
+        val summary = timing.inAppSummary(ObservationOutcome.CANCELLED)
+        assertTrue(summary.toByteArray(Charsets.UTF_8).size <= 500)
+        for (stage in ObservationStage.entries) {
+            assertTrue(summary.contains("${stage.name}=100000000000"))
+        }
+        assertTrue(summary.contains("total_ms=1300000000000"))
+    }
+
+    @Test
+    fun `debug profile writes only metadata to existing local repository`() =
+        runTest {
+            assumeTrue(BuildConfig.DEBUG)
+            val repository = RecordingServerLogRepository()
+            val privatePayload = "private synthetic payload"
+            val value =
+                withContext(ObservationLogSink(repository)) {
+                    profileObservation(ObservationKind.SCREEN) { timing ->
+                        timing.stage(ObservationStage.PRIVACY) { privatePayload }
+                    }
+                }
+            assertEquals(privatePayload, value)
+            val entry = repository.ofType(ServerLogEntry.Type.SERVER).single()
+            assertTrue(entry.message.startsWith("Observation v1 SCREEN RETURNED total_ms="))
+            assertTrue(entry.message.contains("PRIVACY="))
+            assertFalse(entry.message.contains(privatePayload))
+            assertTrue(entry.message.toByteArray(Charsets.UTF_8).size <= 500)
+        }
 }

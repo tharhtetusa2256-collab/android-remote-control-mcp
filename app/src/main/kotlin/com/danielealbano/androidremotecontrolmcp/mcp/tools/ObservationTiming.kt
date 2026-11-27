@@ -2,7 +2,12 @@ package com.danielealbano.androidremotecontrolmcp.mcp.tools
 
 import android.util.Log
 import com.danielealbano.androidremotecontrolmcp.BuildConfig
+import com.danielealbano.androidremotecontrolmcp.data.model.ServerLogEntry
+import com.danielealbano.androidremotecontrolmcp.data.repository.ServerLogRepository
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 
 /** Debug-only, request-local timings. No UI data, identifiers, parameters or exception messages. */
 internal enum class ObservationKind { SCREEN, FIND }
@@ -25,6 +30,8 @@ internal enum class ObservationStage {
 
 internal enum class ObservationOutcome { RETURNED, FAILED, CANCELLED }
 
+private const val NANOS_PER_MILLISECOND = 1_000_000L
+
 internal class ObservationTiming(
     private val kind: ObservationKind,
     private val clock: () -> Long = System::nanoTime,
@@ -41,6 +48,19 @@ internal class ObservationTiming(
         durations[index] += (clock() - start).coerceAtLeast(0L)
         counts[index]++
     }
+
+    // The existing server log store caps an entry at 500 UTF-8 bytes. Milliseconds and fixed
+    // enum names keep even a summary with all 13 stages below that limit.
+    fun inAppSummary(outcome: ObservationOutcome): String =
+        buildString {
+            append("Observation v1 ").append(kind.name)
+            append(' ').append(outcome.name)
+            append(" total_ms=").append((clock() - started).coerceAtLeast(0L) / NANOS_PER_MILLISECOND)
+            for (stage in ObservationStage.entries) {
+                if (counts[stage.ordinal] == 0) continue
+                append(' ').append(stage.name).append('=').append(durations[stage.ordinal] / NANOS_PER_MILLISECOND)
+            }
+        }
 
     fun summary(outcome: ObservationOutcome): String = buildString {
         append("kind=").append(kind.name)
@@ -63,6 +83,20 @@ internal inline fun <T> ObservationTiming?.stage(stage: ObservationStage, block:
     }
 }
 
+/** Internal request-scoped sink. Only the existing local server log repository receives metadata. */
+internal class ObservationLogSink(
+    private val repository: ServerLogRepository,
+) : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<ObservationLogSink>
+
+    fun record(timing: ObservationTiming, outcome: ObservationOutcome) {
+        repository.log(
+            type = ServerLogEntry.Type.SERVER,
+            message = timing.inAppSummary(outcome),
+        )
+    }
+}
+
 /** Observe the existing execution without changing its result or catching its failures. */
 internal suspend fun <T> profileObservation(
     kind: ObservationKind,
@@ -81,5 +115,6 @@ internal suspend fun <T> profileObservation(
     } finally {
         // Diagnostic logging must never replace the original result or exception.
         runCatching { Log.d("MCP:ObservationTiming", timing.summary(outcome)) }
+        runCatching { currentCoroutineContext()[ObservationLogSink]?.record(timing, outcome) }
     }
 }
